@@ -10,7 +10,13 @@ from mms101_controller import MMS101Controller
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(config: DictConfig):
     mms_controller = MMS101Controller(config)
-    mms_controller.run()
+    for i in range(10000) :
+        data = mms_controller.run(i)
+        # print(data.round(1).tolist()[0])
+        print(data.round(1).tolist()[0])
+        # print(data.round(1).tolist()[2])
+        
+
 
 if __name__ == "__main__":
     main()

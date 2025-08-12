@@ -13,7 +13,7 @@ pip install hydra
 <img src="./images/front.jpg" width="200px" height="200px">
 <br>
 - check
-1. Check only pin 2 is raised.
+1. Check whether only pin 2 is raised.
 
 ### 2. network port setting
 ```
@@ -28,6 +28,10 @@ for software connection (this is in config.yaml)
   dest_ip: "192.168.0.200"
   dest_port: 1366
   src_port: 2000
+```
+
+```
+  ping 192.168.0.100
 ```
 
 ### miscellaneous

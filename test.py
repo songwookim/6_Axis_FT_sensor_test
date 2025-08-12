@@ -313,7 +313,7 @@ while True:
     status = mms101eb.cmdStatus()
     if status[4] == 0x03:
         # READY State
-        break;
+        break
     elif status[4] == 0x02:
         # Retry Wait
         time.sleep(0.01)
