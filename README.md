@@ -18,7 +18,7 @@ pip install hydra
 ### 2. network port setting
 ```
 setting to network 
-> address : 192.168.0.100 
+> address : 192.168.0.100
 > Netmask : 255.255.255.0
 > Gateway : 192.168.0.1
 ```

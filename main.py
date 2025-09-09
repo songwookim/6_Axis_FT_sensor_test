@@ -13,8 +13,8 @@ def main(config: DictConfig):
     for i in range(10000) :
         data = mms_controller.run(i)
         # print(data.round(1).tolist()[0])
-        print(data.round(1).tolist()[0])
-        # print(data.round(1).tolist()[2])
+        print(data)
+        # print(data.round(1).tolist()[2])6 
         
 
 
