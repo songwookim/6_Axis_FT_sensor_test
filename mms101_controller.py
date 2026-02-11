@@ -2,10 +2,8 @@ import socket
 import time
 import sys
 import array
-import os
-import hydra
-from omegaconf import DictConfig
 import numpy as np
+from omegaconf import DictConfig
 
 # Sensor Constants
 PROTOCOL_SPI = 0x01
@@ -20,58 +18,65 @@ SENSOR_MAP = {
 
 class MMS101Controller:
     def __init__(self, config):
-        self.dest_ip = config.mms101.dest_ip
-        self.dest_port = config.mms101.dest_port
-        self.src_port = config.mms101.src_port
-        self.measure_max = config.mms101.measure_max
-        self.debug_mode = config.mms101.debug
-        self.sensors = config.mms101.sensors
+        cfg = config.mms101
+        self.dest_ip = cfg.dest_ip
+        self.dest_port = cfg.dest_port
+        self.src_port = cfg.src_port
+        self.measure_max = cfg.measure_max
+        self.debug_mode = cfg.debug
+        self.sensors = cfg.sensors
+        self.n_sensors = cfg.n_sensors
 
         self.n_samples = 0
-        self.sums = 0
+        self.sums = np.zeros([self.n_sensors, 6])
         self.contact_flag = 0
-        self.n_sensors = config.mms101.n_sensors
+        self.offset = np.zeros([self.n_sensors, 6])
 
         self.destAddr = (self.dest_ip, self.dest_port)
         self.srcAddr = ("", self.src_port)
         self.sockOpenFlag = 0
-        self.sensorNo = self.select_sensors(self.sensors)
+        self.sensorNo = self._select_sensors(self.sensors)
         self.sockOpen()
 
-        self.offset = [ # from value .. for three sensor
-            # [8.192, 2.408, -9.377, 0.02204, -0.03774, 0.00149],
-            [-0.249, -0.497, -21.916, -0.03245, 0.00843, 0.00425],
-            # [0.536, -5.577, -34.795, -0.04001, -0.01117, -0.00093],
-        ]
-        # [8.36421440000005, 2.183672700000004, -10.713885600000088, 0.02242086500000042, -0.037813711999999736, -0.0010512370000000009],
-        # [-0.04749409999999947, -0.7636865000000049, -22.082769699999872, -0.03188875300000068, 0.008093128999999978, 0.0027501949999999904],
-        # [0.883569300000005, -6.541234199999963, -38.84847440000024, -0.039831948000000714, -0.012960584000000108, -0.002638050999999999]
-        # if self.n_sensors != 3:
-        #     print("Error: Only 3 sensors are supported")
-        #     sys.exit()
+        self._init_device()
+    # ── Initialization ────────────────────────────────────────
 
+    def _init_device(self):
+        """Reset → Select → Boot → wait for READY state."""
         self.cmdReset()
         self.cmdSelect()
         self.cmdBoot()
+        time.sleep(0.05)
 
-        while True:
+        t0 = time.time()
+        while time.time() - t0 < 5.0:
             status = self.cmdStatus()
-            if status[4] == 0x03:  # READY state
-                break
-            elif status[4] == 0x02:
-                # time.sleep(0.001)
-                # print("Waiting...")
-                pass
-            else:
-                print("BOOT Error")
-                sys.exit()
-    
+            if not status or len(status) < 5:
+                continue
+            if status[4] == 0x03:       # READY
+                return
+            elif status[4] == 0x02:     # WAIT
+                time.sleep(0.01)
+            else:                       # ERROR → retry
+                if self.debug_mode:
+                    print("[init] error state, retrying reset/select/boot")
+                self.cmdReset(); time.sleep(0.02)
+                self.cmdSelect(); time.sleep(0.02)
+                self.cmdBoot(); time.sleep(0.05)
+
+        print("[init] timeout: device not READY")
+        sys.exit(1)
+
     def __del__(self):
         self.sockClose()
+
+    # ── Socket ────────────────────────────────────────────────
 
     def sockOpen(self):
         self.sockDsc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sockDsc.bind(self.srcAddr)
+        # Avoid infinite blocking on recv
+        self.sockDsc.settimeout(0.8)
         self.sockOpenFlag = 1
 
     def sockClose(self):
@@ -80,11 +85,20 @@ class MMS101Controller:
             self.sockDsc.close()
             self.sockOpenFlag = 0
 
+    # ── Low-level I/O ─────────────────────────────────────────
+
     def recvData(self, rcvLen):
-        data = self.sockDsc.recv(rcvLen)
-        if self.debug_mode:
-            print(data.hex())
-        return data
+        try:
+            data = self.sockDsc.recv(rcvLen)
+            if self.debug_mode:
+                print(data.hex())
+            return data
+        except socket.timeout:
+            if self.debug_mode:
+                print(f"[timeout] expecting {rcvLen} bytes")
+            return b""
+
+    # ── Commands ──────────────────────────────────────────────
 
     def cmdStart(self):
         self.send_cmd([0xF0])
@@ -122,81 +136,62 @@ class MMS101Controller:
         self.send_cmd([0xA2])
         return self.recvData(8)
 
-    def send_cmd(self, cmd):
-        sendSz = self.sockDsc.sendto(array.array('B', cmd), self.destAddr)
-        if sendSz != len(cmd):
-            print(f"Error: Command send {cmd}")
+    # ── Helpers ───────────────────────────────────────────────
 
-    def select_sensors(self, sensor_list):
+    def send_cmd(self, cmd):
+        sent = self.sockDsc.sendto(array.array('B', cmd), self.destAddr)
+        if sent != len(cmd):
+            print(f"[ERROR] send failed: {cmd}")
+
+    @staticmethod
+    def _select_sensors(sensor_list):
         selected = 0
         for sens in sensor_list:
             if sens in SENSOR_MAP:
                 selected |= SENSOR_MAP[sens]
         return selected
 
-    def run(self, period):
-        # print("Starting Measurement...")
+    # ── Data acquisition ──────────────────────────────────────
 
+    def _parse_data(self, raw):
+        """Parse 100-byte DATA response → (n_sensors, 6) ndarray."""
+        data = np.zeros([self.n_sensors, 6])
+        for sens in range(self.n_sensors):
+            for axis in range(6):
+                idx = (sens * 18) + (axis * 3) + 10
+                val = (raw[idx] << 16) | (raw[idx + 1] << 8) | raw[idx + 2]
+                if val >= 0x00800000:
+                    val -= 0x1000000
+                data[sens][axis] = val / (1000 if axis < 3 else 100000)
+        return data
+
+    def _update_offset(self, raw_data, period):
+        """Dynamically calibrate zero-offset."""
+        sensed = raw_data - self.offset
+        if np.abs(sensed.sum()) > 0.1 and period > 5000:
+            self.contact_flag = 1
+        else:
+            self.contact_flag = 0
+
+        if period < 5000 or self.contact_flag == 0:
+            self.sums += raw_data
+            self.n_samples += 1
+            if self.n_samples > 300:
+                self.offset = self.sums / self.n_samples
+                self.n_samples = 0
+                self.sums = np.zeros([self.n_sensors, 6])
+
+    def run(self, period):
+        """Single measurement cycle. Returns offset-corrected (n_sensors, 6) ndarray."""
         self.cmdStart()
         time.sleep(0.0001)
 
-        dataCounter = 0
-        elapsTime = 0
-        mms101data = np.zeros([self.n_sensors, 6])
-
-        # while dataCounter < self.measure_max:
         rData = self.cmdData()
-        # os.system('clear')
-        if len(rData) == 100 and rData[0] == 0x00:
-            measStatus = (rData[2] << 8) + rData[3]
-            measCount = (rData[4] << 8) + rData[5]
-            intervalTime = (rData[6] << 24) + (rData[7] << 16) + (rData[8] << 8) + rData[9]
-            elapsTime += intervalTime / 1000000
+        if len(rData) != 100 or rData[0] != 0x00:
+            return np.zeros([self.n_sensors, 6])
 
-            for sens in range(self.n_sensors):
-                for axis in range(6):
-                    base_index = (sens * 18) + (axis * 3) + 10
-                    mms101data[sens][axis] = (rData[base_index] << 16) + (rData[base_index + 1] << 8) + rData[base_index + 2]
-                    if mms101data[sens][axis] >= 0x00800000:
-                        mms101data[sens][axis] -= 0x1000000
+        mms101data = self._parse_data(rData)
+        self._update_offset(mms101data, period)
 
-                    mms101data[sens][axis] /= 1000 if axis < 3 else 100000
+        return mms101data - self.offset
 
-            # Print debug information
-            # print(f'intervalTime : {intervalTime},{measCount}')
-
-            # Accumulate sums for offset calculation
-
-
-            # Calculate dynamic offset after collecting sufficient samples
-            # Apply the offset to correct the data
-            sensed_data = (np.array(mms101data) - np.array(self.offset))
-            if np.abs(sensed_data.sum()) > 0.1 and period > 5000 :
-                self.contact_flag = 1
-            else:
-                self.contact_flag = 0
-            # print(f"{period} : {sensed_data.sum().round(2)}" )
-            # print(f" is? : {self.contact_flag}" )
-            # if self.contact_flag != True:  
-            #     # 튀는 값 필터링
-            if period < 5000:
-                self.sums += mms101data
-                self.n_samples += 1      
-                if self.n_samples > 300: 
-                    self.offset = self.sums / self.n_samples  # Calculate the average offset
-                    self.n_samples = 0  # Reset the number of samples
-                    self.sums = 0
-            else :
-                if self.contact_flag == 0:
-                    self.sums += mms101data
-                    self.n_samples += 1  
-                if self.contact_flag == 0 :
-                    if self.n_samples > 300: 
-                        self.offset = self.sums / self.n_samples  # Calculate the average offset
-                        self.n_samples = 0  # Reset the number of samples
-                        self.sums = 0
-            # print(sensed_data)
-
-            return sensed_data        
-            
-            
